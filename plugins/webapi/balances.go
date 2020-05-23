@@ -1,6 +1,7 @@
 package webapi
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 
@@ -9,41 +10,33 @@ import (
 
 	"github.com/iotaledger/iota.go/address"
 
-	"github.com/gohornet/hornet/packages/model/tangle"
+	"github.com/gohornet/hornet/pkg/model/tangle"
 )
 
 func init() {
 	addEndpoint("getBalances", getBalances, implementedAPIcalls)
 }
 
-func getBalances(i interface{}, c *gin.Context, abortSignal <-chan struct{}) {
-	gb := &GetBalances{}
+func getBalances(i interface{}, c *gin.Context, _ <-chan struct{}) {
 	e := ErrorReturn{}
+	query := &GetBalances{}
 
-	err := mapstructure.Decode(i, gb)
-	if err != nil {
-		e.Error = "Internal error"
+	if err := mapstructure.Decode(i, query); err != nil {
+		e.Error = fmt.Sprintf("%v: %v", ErrInternalError, err)
 		c.JSON(http.StatusInternalServerError, e)
 		return
 	}
 
-	if len(gb.Addresses) == 0 {
+	if len(query.Addresses) == 0 {
 		e.Error = "No addresses provided"
-		c.JSON(http.StatusBadRequest, e)
-	}
-
-	if !tangle.IsNodeSynced() {
-		e.Error = "Node not synced"
 		c.JSON(http.StatusBadRequest, e)
 		return
 	}
 
-	gbr := &GetBalancesReturn{}
-
-	for _, addr := range gb.Addresses {
+	for _, addr := range query.Addresses {
 		// Check if address is valid
 		if err := address.ValidAddress(addr); err != nil {
-			e.Error = "Invalid address: " + addr
+			e.Error = fmt.Sprintf("%v: %v", err, addr)
 			c.JSON(http.StatusBadRequest, e)
 			return
 		}
@@ -52,15 +45,23 @@ func getBalances(i interface{}, c *gin.Context, abortSignal <-chan struct{}) {
 	tangle.ReadLockLedger()
 	defer tangle.ReadUnlockLedger()
 
+	if !tangle.IsNodeSynced() {
+		e.Error = ErrNodeNotSync.Error()
+		c.JSON(http.StatusBadRequest, e)
+		return
+	}
+
 	cachedLatestSolidMs := tangle.GetMilestoneOrNil(tangle.GetSolidMilestoneIndex()) // bundle +1
 	if cachedLatestSolidMs == nil {
 		e.Error = "Ledger state invalid - Milestone not found"
 		c.JSON(http.StatusInternalServerError, e)
 		return
 	}
-	defer cachedLatestSolidMs.Release() // bundle -1
+	defer cachedLatestSolidMs.Release(true) // bundle -1
 
-	for _, addr := range gb.Addresses {
+	result := GetBalancesReturn{}
+
+	for _, addr := range query.Addresses {
 
 		balance, _, err := tangle.GetBalanceForAddressWithoutLocking(addr[:81])
 		if err != nil {
@@ -70,11 +71,11 @@ func getBalances(i interface{}, c *gin.Context, abortSignal <-chan struct{}) {
 		}
 
 		// Address balance
-		gbr.Balances = append(gbr.Balances, strconv.FormatUint(balance, 10))
+		result.Balances = append(result.Balances, strconv.FormatUint(balance, 10))
 	}
 
 	// The index of the milestone that confirmed the most recent balance
-	gbr.MilestoneIndex = uint32(cachedLatestSolidMs.GetBundle().GetMilestoneIndex())
-	gbr.References = []string{cachedLatestSolidMs.GetBundle().GetMilestoneHash()}
-	c.JSON(http.StatusOK, gbr)
+	result.MilestoneIndex = cachedLatestSolidMs.GetBundle().GetMilestoneIndex()
+	result.References = []string{cachedLatestSolidMs.GetBundle().GetMilestoneHash()}
+	c.JSON(http.StatusOK, result)
 }

@@ -4,15 +4,15 @@ import (
 	"math"
 	"sync"
 
-	"github.com/gohornet/hornet/packages/model/milestone_index"
-	"github.com/gohornet/hornet/packages/model/tangle"
+	"github.com/gohornet/hornet/pkg/model/milestone"
+	"github.com/gohornet/hornet/pkg/model/tangle"
 	"github.com/iotaledger/iota.go/trinary"
 )
 
 // keeps track of whether a tx is below the max depth for the given milestone
 type belowDepthMemoizationCache struct {
 	mu               sync.RWMutex
-	milestone        milestone_index.MilestoneIndex
+	milestone        milestone.Index
 	memoizationCache map[trinary.Hash]bool
 	hits             uint64
 	misses           uint64
@@ -31,7 +31,7 @@ func (bdmc *belowDepthMemoizationCache) IsBelowMaxDepth(hash trinary.Hash) *bool
 	return &is
 }
 
-func (bdmc *belowDepthMemoizationCache) ResetIfNewerMilestone(currentIndex milestone_index.MilestoneIndex) {
+func (bdmc *belowDepthMemoizationCache) ResetIfNewerMilestone(currentIndex milestone.Index) {
 	bdmc.mu.Lock()
 	if currentIndex > bdmc.milestone {
 		bdmc.memoizationCache = make(map[trinary.Hash]bool)
@@ -60,12 +60,12 @@ var BelowDepthMemoizationCache = belowDepthMemoizationCache{memoizationCache: ma
 // within the range of allowed milestones. if not, it is checked whether any referenced (directly/indirectly) tx
 // is confirmed by a milestone below the allowed threshold until a limit is reached of analyzed txs, in which case
 // the given tail transaction is also deemed being below max depth.
-func IsBelowMaxDepth(cachedTailTx *tangle.CachedTransaction, lowerAllowedSnapshotIndex int) bool {
+func IsBelowMaxDepth(cachedTailTx *tangle.CachedTransaction, lowerAllowedSnapshotIndex int, forceRelease bool) bool {
 
-	defer cachedTailTx.Release() // tx -1
+	defer cachedTailTx.Release(forceRelease) // tx -1
 
 	// if the tx is already confirmed we don't need to check it for max depth
-	if confirmed, at := cachedTailTx.GetTransaction().GetConfirmed(); confirmed && int(at) >= lowerAllowedSnapshotIndex {
+	if confirmed, at := cachedTailTx.GetMetadata().GetConfirmed(); confirmed && int(at) >= lowerAllowedSnapshotIndex {
 		return false
 	}
 
@@ -109,33 +109,33 @@ func IsBelowMaxDepth(cachedTailTx *tangle.CachedTransaction, lowerAllowedSnapsho
 				continue
 			}
 
-			cachedTx := tangle.GetCachedTransaction(txHash) // tx +1
+			cachedTx := tangle.GetCachedTransactionOrNil(txHash) // tx +1
 
 			// we should have the transaction because the to be checked tail tx is solid
 			// and we passed the point where we checked whether the tx is a solid entry point
-			if !cachedTx.Exists() {
+			if cachedTx == nil {
 				log.Panicf("missing transaction %s for below max depth check", txHash)
 			}
 
-			confirmed, at := cachedTx.GetTransaction().GetConfirmed()
+			confirmed, at := cachedTx.GetMetadata().GetConfirmed()
 
 			// we are below max depth on this transaction if it is confirmed by a milestone below our threshold
 			if confirmed && int(at) < lowerAllowedSnapshotIndex {
 				BelowDepthMemoizationCache.Set(cachedTailTx.GetTransaction().GetHash(), true)
-				cachedTx.Release() // tx -1
+				cachedTx.Release(forceRelease) // tx -1
 				return true
 			}
 
 			// we don't need to analyze further down if the transaction is confirmed within the threshold of the max depth
 			if confirmed {
-				cachedTx.Release() // tx -1
+				cachedTx.Release(forceRelease) // tx -1
 				continue
 			}
 
 			//
 			txsToTraverse[cachedTx.GetTransaction().GetTrunk()] = struct{}{}
 			txsToTraverse[cachedTx.GetTransaction().GetBranch()] = struct{}{}
-			cachedTx.Release() // tx -1
+			cachedTx.Release(forceRelease) // tx -1
 		}
 	}
 

@@ -7,7 +7,7 @@ import (
 
 	"github.com/iotaledger/hive.go/objectstorage"
 
-	"github.com/gohornet/hornet/packages/profile"
+	"github.com/gohornet/hornet/pkg/profile"
 )
 
 var (
@@ -26,34 +26,35 @@ func (r *invalidBundleReference) Update(other objectstorage.StorableObject) {
 	panic("invalidBundleReference should never be updated")
 }
 
-func (r *invalidBundleReference) GetStorageKey() []byte {
+func (r *invalidBundleReference) ObjectStorageKey() []byte {
 	return r.hashBytes
 }
 
-func (r *invalidBundleReference) MarshalBinary() (data []byte, err error) {
-	return nil, nil
-}
-
-func (r *invalidBundleReference) UnmarshalBinary(data []byte) error {
+func (r *invalidBundleReference) ObjectStorageValue() (_ []byte) {
 	return nil
 }
 
-func invalidBundleFactory(key []byte) objectstorage.StorableObject {
+func (r *invalidBundleReference) UnmarshalObjectStorageValue(_ []byte) (consumedBytes int, err error) {
+	return 0, nil
+}
+
+func invalidBundleFactory(key []byte) (objectstorage.StorableObject, int, error) {
 	invalidBndl := &invalidBundleReference{
 		hashBytes: make([]byte, len(key)),
 	}
 	copy(invalidBndl.hashBytes, key)
-	return invalidBndl
+	return invalidBndl, len(key), nil
 }
 
 func configureRefsAnInvalidBundleStorage() {
-	opts := profile.GetProfile().Caches.RefsInvalidBundle
+	opts := profile.LoadProfile().Caches.RefsInvalidBundle
 
 	refsAnInvalidBundleStorage = objectstorage.New(
 		nil,
 		invalidBundleFactory,
 		objectstorage.CacheTime(time.Duration(opts.CacheTimeMs)*time.Millisecond),
 		objectstorage.PersistenceEnabled(false),
+		objectstorage.KeysOnly(true),
 		objectstorage.LeakDetectionEnabled(opts.LeakDetectionOptions.Enabled,
 			objectstorage.LeakDetectionOptions{
 				MaxConsumersPerObject: opts.LeakDetectionOptions.MaxConsumersPerObject,
@@ -68,7 +69,12 @@ func GetRefsAnInvalidBundleStorageSize() int {
 
 // +-0
 func PutInvalidBundleReference(txHash trinary.Hash) {
-	refsAnInvalidBundleStorage.Put(invalidBundleFactory(trinary.MustTrytesToBytes(txHash)[:49])).Release()
+	invalidBundleRef, _, _ := invalidBundleFactory(trinary.MustTrytesToBytes(txHash)[:49])
+
+	// Do not force the release, otherwise the object is gone (no persistence enabled)
+	refsAnInvalidBundleStorage.ComputeIfAbsent(invalidBundleRef.ObjectStorageKey(), func(key []byte) objectstorage.StorableObject {
+		return invalidBundleRef
+	}).Release()
 }
 
 // +-0

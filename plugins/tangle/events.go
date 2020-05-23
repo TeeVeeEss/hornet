@@ -1,10 +1,14 @@
 package tangle
 
 import (
-	"github.com/gohornet/hornet/packages/model/milestone_index"
-	"github.com/gohornet/hornet/packages/model/tangle"
+	"github.com/gohornet/hornet/pkg/model/milestone"
+	"github.com/gohornet/hornet/pkg/model/tangle"
 	"github.com/iotaledger/hive.go/events"
 )
+
+func NewConfirmedMilestoneMetricCaller(handler interface{}, params ...interface{}) {
+	handler.(func(metric *ConfirmedMilestoneMetric))(params[0].(*ConfirmedMilestoneMetric))
+}
 
 var Events = pluginEvents{
 	ReceivedNewTransaction:        events.NewEvent(tangle.NewTransactionCaller),
@@ -15,7 +19,9 @@ var Events = pluginEvents{
 	ReceivedNewMilestone:          events.NewEvent(tangle.BundleCaller),
 	LatestMilestoneChanged:        events.NewEvent(tangle.BundleCaller),
 	SolidMilestoneChanged:         events.NewEvent(tangle.BundleCaller),
-	SnapshotMilestoneIndexChanged: events.NewEvent(milestone_index.MilestoneIndexCaller),
+	SnapshotMilestoneIndexChanged: events.NewEvent(milestone.IndexCaller),
+	PruningMilestoneIndexChanged:  events.NewEvent(milestone.IndexCaller),
+	NewConfirmedMilestoneMetric:   events.NewEvent(NewConfirmedMilestoneMetricCaller),
 }
 
 type pluginEvents struct {
@@ -28,4 +34,6 @@ type pluginEvents struct {
 	LatestMilestoneChanged        *events.Event
 	SolidMilestoneChanged         *events.Event
 	SnapshotMilestoneIndexChanged *events.Event
+	PruningMilestoneIndexChanged  *events.Event
+	NewConfirmedMilestoneMetric   *events.Event
 }

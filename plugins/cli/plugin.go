@@ -14,14 +14,14 @@ import (
 	"github.com/iotaledger/hive.go/node"
 	"github.com/iotaledger/hive.go/timeutil"
 
-	"github.com/gohornet/hornet/packages/parameter"
-	"github.com/gohornet/hornet/packages/profile"
-	"github.com/gohornet/hornet/packages/shutdown"
+	"github.com/gohornet/hornet/pkg/config"
+	"github.com/gohornet/hornet/pkg/profile"
+	"github.com/gohornet/hornet/pkg/shutdown"
 )
 
 var (
 	// AppVersion version number
-	AppVersion          = "0.3.0"
+	AppVersion          = "0.4.0-rc10"
 	LatestGithubVersion = AppVersion
 
 	// AppName app code name
@@ -50,10 +50,10 @@ func init() {
 }
 
 func parseParameters() {
-	for _, pluginName := range parameter.NodeConfig.GetStringSlice("node.disableplugins") {
+	for _, pluginName := range config.NodeConfig.GetStringSlice(node.CFG_DISABLE_PLUGINS) {
 		node.DisabledPlugins[strings.ToLower(pluginName)] = true
 	}
-	for _, pluginName := range parameter.NodeConfig.GetStringSlice("node.enableplugins") {
+	for _, pluginName := range config.NodeConfig.GetStringSlice(node.CFG_ENABLE_PLUGINS) {
 		node.EnabledPlugins[strings.ToLower(pluginName)] = true
 	}
 }
@@ -68,7 +68,7 @@ func configure(plugin *node.Plugin) {
 		FixVersionStrFunc: latest.DeleteFrontV(),
 	}
 
-	fmt.Print(fmt.Sprintf(`
+	fmt.Printf(`
               ██╗  ██╗ ██████╗ ██████╗ ███╗   ██╗███████╗████████╗
               ██║  ██║██╔═══██╗██╔══██╗████╗  ██║██╔════╝╚══██╔══╝
               ███████║██║   ██║██████╔╝██╔██╗ ██║█████╗     ██║
@@ -76,14 +76,14 @@ func configure(plugin *node.Plugin) {
               ██║  ██║╚██████╔╝██║  ██║██║ ╚████║███████╗   ██║
               ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝   ╚═╝
                                    v%s
-`+"\n\n", AppVersion))
+`+"\n\n", AppVersion)
 
 	checkLatestVersion()
 
-	if parameter.NodeConfig.GetString("useProfile") == "auto" {
-		log.Infof("Profile mode 'auto', Using profile '%s'", profile.GetProfile().Name)
+	if config.NodeConfig.GetString(profile.CfgUseProfile) == profile.AutoProfileName {
+		log.Infof("Profile mode 'auto', Using profile '%s'", profile.LoadProfile().Name)
 	} else {
-		log.Infof("Using profile '%s'", profile.GetProfile().Name)
+		log.Infof("Using profile '%s'", profile.LoadProfile().Name)
 	}
 
 	log.Info("Loading plugins ...")
@@ -91,7 +91,11 @@ func configure(plugin *node.Plugin) {
 
 func checkLatestVersion() {
 
-	res, _ := latest.Check(githubTag, AppVersion)
+	res, err := latest.Check(githubTag, AppVersion)
+	if err != nil {
+		log.Warnf("Update check failed: %s", err.Error())
+		return
+	}
 
 	if res.Outdated {
 		log.Infof("Update to %s available on https://github.com/gohornet/hornet/releases/latest", res.Current)
@@ -99,10 +103,10 @@ func checkLatestVersion() {
 	}
 }
 
-func run(plugin *node.Plugin) {
+func run(_ *node.Plugin) {
 
 	// create a background worker that checks for latest version every hour
 	daemon.BackgroundWorker("Version update checker", func(shutdownSignal <-chan struct{}) {
 		timeutil.Ticker(checkLatestVersion, 1*time.Hour, shutdownSignal)
-	}, shutdown.ShutdownPriorityUpdateCheck)
+	}, shutdown.PriorityUpdateCheck)
 }

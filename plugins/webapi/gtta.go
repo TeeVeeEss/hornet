@@ -1,6 +1,7 @@
 package webapi
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -16,14 +17,12 @@ func init() {
 	addEndpoint("getTransactionsToApprove", getTransactionsToApprove, implementedAPIcalls)
 }
 
-func getTransactionsToApprove(i interface{}, c *gin.Context, abortSignal <-chan struct{}) {
+func getTransactionsToApprove(i interface{}, c *gin.Context, _ <-chan struct{}) {
 	e := ErrorReturn{}
 	query := &GetTransactionsToApprove{}
-	result := GetTransactionsToApproveReturn{}
 
-	err := mapstructure.Decode(i, query)
-	if err != nil {
-		e.Error = "Internal error"
+	if err := mapstructure.Decode(i, query); err != nil {
+		e.Error = fmt.Sprintf("%v: %v", ErrInternalError, err)
 		c.JSON(http.StatusInternalServerError, e)
 		return
 	}
@@ -40,16 +39,15 @@ func getTransactionsToApprove(i interface{}, c *gin.Context, abortSignal <-chan 
 
 	tips, _, err := tipselection.SelectTips(query.Depth, reference)
 	if err != nil {
-		e.Error = err.Error()
 		if err == tipselection.ErrNodeNotSynced {
+			e.Error = err.Error()
 			c.JSON(http.StatusServiceUnavailable, e)
 			return
 		}
+		e.Error = fmt.Sprintf("%v: %v", ErrInternalError, err)
 		c.JSON(http.StatusInternalServerError, e)
 		return
 	}
 
-	result.TrunkTransaction = tips[0]
-	result.BranchTransaction = tips[1]
-	c.JSON(http.StatusOK, result)
+	c.JSON(http.StatusOK, GetTransactionsToApproveReturn{TrunkTransaction: tips[0], BranchTransaction: tips[1]})
 }

@@ -3,7 +3,8 @@ package tangle
 import (
 	"time"
 
-	"github.com/iotaledger/iota.go/trinary"
+	"github.com/pkg/errors"
+	"github.com/spf13/pflag"
 
 	"github.com/iotaledger/hive.go/daemon"
 	"github.com/iotaledger/hive.go/events"
@@ -11,12 +12,11 @@ import (
 	"github.com/iotaledger/hive.go/node"
 	"github.com/iotaledger/hive.go/timeutil"
 
-	"github.com/gohornet/hornet/packages/database"
-	"github.com/gohornet/hornet/packages/model/milestone_index"
-	"github.com/gohornet/hornet/packages/model/tangle"
-	"github.com/gohornet/hornet/packages/parameter"
-	"github.com/gohornet/hornet/packages/profile"
-	"github.com/gohornet/hornet/packages/shutdown"
+	"github.com/gohornet/hornet/pkg/config"
+	"github.com/gohornet/hornet/pkg/model/milestone"
+	"github.com/gohornet/hornet/pkg/model/tangle"
+	"github.com/gohornet/hornet/pkg/shutdown"
+	"github.com/gohornet/hornet/plugins/database"
 	"github.com/gohornet/hornet/plugins/gossip"
 )
 
@@ -24,23 +24,26 @@ var (
 	PLUGIN                        = node.NewPlugin("Tangle", node.Enabled, configure, run)
 	belowMaxDepthTransactionLimit int
 	log                           *logger.Logger
+	updateSyncedAtStartup         bool
+
+	syncedAtStartup = pflag.Bool("syncedAtStartup", false, "LMI is set to LSMI at startup")
+
+	ErrDatabaseRevalidationFailed = errors.New("Database revalidation failed! Please delete the database folder and start with a new local snapshot.")
 )
+
+func init() {
+	pflag.CommandLine.MarkHidden("syncedAtStartup")
+}
 
 func configure(plugin *node.Plugin) {
 	log = logger.NewLogger(plugin.Name)
 
-	belowMaxDepthTransactionLimit = parameter.NodeConfig.GetInt("tipsel.belowMaxDepthTransactionLimit")
+	belowMaxDepthTransactionLimit = config.NodeConfig.GetInt(config.CfgTipSelBelowMaxDepthTransactionLimit)
 	configureRefsAnInvalidBundleStorage()
 
-	tangle.ConfigureDatabases(parameter.NodeConfig.GetString("db.path"), &profile.GetProfile().Badger)
+	tangle.LoadInitialValuesFromDatabase()
 
-	if tangle.IsDatabaseCorrupted() {
-		log.Panic("HORNET was not shut down correctly. Database is corrupted. Please delete the database folder and start with a new local snapshot.")
-	}
-
-	if !tangle.IsCorrectDatabaseVersion() {
-		log.Panic("HORNET database version mismatch. The database scheme was updated. Please delete the database folder and start with a new local snapshot.")
-	}
+	updateSyncedAtStartup = *syncedAtStartup
 
 	// Create a background worker that marks the database as corrupted at clean startup.
 	// This has to be done in a background worker, because the Daemon could receive
@@ -51,13 +54,14 @@ func configure(plugin *node.Plugin) {
 	})
 
 	tangle.ConfigureMilestones(
-		trinary.Hash(parameter.NodeConfig.GetString("milestones.coordinator")),
-		parameter.NodeConfig.GetInt("milestones.coordinatorSecurityLevel"),
-		uint64(parameter.NodeConfig.GetInt("milestones.numberOfKeysInAMilestone")),
+		config.NodeConfig.GetString(config.CfgCoordinatorAddress),
+		config.NodeConfig.GetInt(config.CfgCoordinatorSecurityLevel),
+		uint64(config.NodeConfig.GetInt(config.CfgCoordinatorMerkleTreeDepth)),
 	)
 
 	daemon.BackgroundWorker("Cleanup at shutdown", func(shutdownSignal <-chan struct{}) {
 		<-shutdownSignal
+		abortMilestoneSolidification()
 
 		log.Info("Flushing caches to database...")
 		tangle.ShutdownMilestoneStorage()
@@ -65,42 +69,55 @@ func configure(plugin *node.Plugin) {
 		tangle.ShutdownBundleTransactionsStorage()
 		tangle.ShutdownTransactionStorage()
 		tangle.ShutdownApproversStorage()
+		tangle.ShutdownTagsStorage()
+		tangle.ShutdownAddressStorage()
+		tangle.ShutdownUnconfirmedTxsStorage()
+		tangle.ShutdownSpentAddressesStorage()
 		log.Info("Flushing caches to database... done")
 
-		tangle.MarkDatabaseHealthy()
-
-		log.Info("Syncing database to disk...")
-		database.GetHornetBadgerInstance().Close()
-		log.Info("Syncing database to disk... done")
-	}, shutdown.ShutdownPriorityFlushToDatabase)
+	}, shutdown.PriorityFlushToDatabase)
 
 	Events.SolidMilestoneChanged.Attach(events.NewClosure(func(cachedBndl *tangle.CachedBundle) {
-		// notify neighbors about our new solid milestone index
-		gossip.SendHeartbeat()
-		gossip.SendMilestoneRequests(cachedBndl.GetBundle().GetMilestoneIndex(), tangle.GetLatestMilestoneIndex())
-		cachedBndl.Release() // bundle -1
+		defer cachedBndl.Release() // bundle -1
+		// notify peers about our new solid milestone index
+		gossip.BroadcastHeartbeat()
 	}))
 
-	Events.SnapshotMilestoneIndexChanged.Attach(events.NewClosure(func(msIndex milestone_index.MilestoneIndex) {
-		// notify neighbors about our new solid milestone index
-		gossip.SendHeartbeat()
-		gossip.SendMilestoneRequests(msIndex, tangle.GetLatestMilestoneIndex())
+	Events.PruningMilestoneIndexChanged.Attach(events.NewClosure(func(msIndex milestone.Index) {
+		// notify peers about our new pruning milestone index
+		gossip.BroadcastHeartbeat()
 	}))
 
-	tangle.LoadInitialValuesFromDatabase()
 	configureTangleProcessor(plugin)
+
+	gossip.AddRequestBackpressureSignal(IsReceiveTxWorkerPoolBusy)
 }
 
 func run(plugin *node.Plugin) {
+
+	if tangle.IsDatabaseCorrupted() {
+		log.Warnf("HORNET was not shut down correctly, the database may be corrupted. Starting revalidation...")
+
+		if err := revalidateDatabase(); err != nil {
+			log.Panic(errors.Wrap(ErrDatabaseRevalidationFailed, err.Error()))
+		}
+		log.Info("database revalidation successful")
+	}
+
+	// run a full database garbage collection at startup
+	database.RunGarbageCollection()
+
+	tangle.SetLatestMilestoneIndex(tangle.GetSolidMilestoneIndex(), updateSyncedAtStartup)
+
 	runTangleProcessor(plugin)
 
 	// create a background worker that prints a status message every second
 	daemon.BackgroundWorker("Tangle status reporter", func(shutdownSignal <-chan struct{}) {
 		timeutil.Ticker(printStatus, 1*time.Second, shutdownSignal)
-	}, shutdown.ShutdownPriorityStatusReport)
+	}, shutdown.PriorityStatusReport)
+}
 
-	// create a db cleanup worker
-	daemon.BackgroundWorker("Badger garbage collection", func(shutdownSignal <-chan struct{}) {
-		timeutil.Ticker(database.CleanupHornetBadgerInstance, 5*time.Minute, shutdownSignal)
-	}, shutdown.ShutdownPriorityBadgerGarbageCollection)
+// SetUpdateSyncedAtStartup sets the flag if the isNodeSynced status should be updated at startup
+func SetUpdateSyncedAtStartup(updateSynced bool) {
+	updateSyncedAtStartup = updateSynced
 }

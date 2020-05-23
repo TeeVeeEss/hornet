@@ -12,28 +12,27 @@ import (
 	"github.com/iotaledger/iota.go/guards"
 	"github.com/iotaledger/iota.go/transaction"
 
-	"github.com/gohornet/hornet/packages/model/tangle"
-	"github.com/gohornet/hornet/packages/parameter"
+	"github.com/gohornet/hornet/pkg/config"
+	"github.com/gohornet/hornet/pkg/model/tangle"
 )
 
 func init() {
 	addEndpoint("getTrytes", getTrytes, implementedAPIcalls)
 }
 
-func getTrytes(i interface{}, c *gin.Context, abortSignal <-chan struct{}) {
-
-	maxGetTrytes := parameter.NodeConfig.GetInt("api.maxGetTrytes")
-
-	gt := &GetTrytes{}
+func getTrytes(i interface{}, c *gin.Context, _ <-chan struct{}) {
 	e := ErrorReturn{}
-	err := mapstructure.Decode(i, gt)
-	if err != nil {
-		e.Error = "Internal error"
+	query := &GetTrytes{}
+
+	maxGetTrytes := config.NodeConfig.GetInt(config.CfgWebAPILimitsMaxGetTrytes)
+
+	if err := mapstructure.Decode(i, query); err != nil {
+		e.Error = fmt.Sprintf("%v: %v", ErrInternalError, err)
 		c.JSON(http.StatusInternalServerError, e)
 		return
 	}
 
-	if len(gt.Hashes) > maxGetTrytes {
+	if len(query.Hashes) > maxGetTrytes {
 		e.Error = "Too many hashes. Max. allowed: " + strconv.Itoa(maxGetTrytes)
 		c.JSON(http.StatusBadRequest, e)
 		return
@@ -41,7 +40,7 @@ func getTrytes(i interface{}, c *gin.Context, abortSignal <-chan struct{}) {
 
 	trytes := []string{}
 
-	for _, hash := range gt.Hashes {
+	for _, hash := range query.Hashes {
 		if !guards.IsTransactionHash(hash) {
 			e.Error = fmt.Sprintf("Invalid hash supplied: %s", hash)
 			c.JSON(http.StatusBadRequest, e)
@@ -49,22 +48,24 @@ func getTrytes(i interface{}, c *gin.Context, abortSignal <-chan struct{}) {
 		}
 	}
 
-	for _, hash := range gt.Hashes {
-		cachedTx := tangle.GetCachedTransaction(hash) // tx +1
+	for _, hash := range query.Hashes {
+		cachedTx := tangle.GetCachedTransactionOrNil(hash) // tx +1
 
-		if cachedTx.Exists() {
-			tx, err := transaction.TransactionToTrytes(cachedTx.GetTransaction().Tx)
-			if err != nil {
-				e.Error = "Internal error"
-				c.JSON(http.StatusInternalServerError, e)
-				cachedTx.Release() // tx -1
-				return
-			}
-			trytes = append(trytes, tx)
-		} else {
+		if cachedTx == nil {
 			trytes = append(trytes, strings.Repeat("9", 2673))
+			continue
 		}
-		cachedTx.Release() // tx -1
+
+		tx, err := transaction.TransactionToTrytes(cachedTx.GetTransaction().Tx)
+		if err != nil {
+			e.Error = fmt.Sprintf("%v: %v", ErrInternalError, err)
+			c.JSON(http.StatusInternalServerError, e)
+			cachedTx.Release(true) // tx -1
+			return
+		}
+
+		trytes = append(trytes, tx)
+		cachedTx.Release(true) // tx -1
 	}
 
 	c.JSON(http.StatusOK, GetTrytesReturn{Trytes: trytes})

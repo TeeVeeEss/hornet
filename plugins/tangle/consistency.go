@@ -3,21 +3,25 @@ package tangle
 import (
 	"errors"
 
+	"github.com/iotaledger/iota.go/consts"
+	"github.com/iotaledger/iota.go/math"
 	"github.com/iotaledger/iota.go/trinary"
 
-	"github.com/gohornet/hornet/packages/model/milestone_index"
-	"github.com/gohornet/hornet/packages/model/tangle"
+	"github.com/gohornet/hornet/pkg/model/hornet"
+	"github.com/gohornet/hornet/pkg/model/milestone"
+	"github.com/gohornet/hornet/pkg/model/tangle"
 )
 
 var (
-	ErrRefBundleNotValid    = errors.New("a referenced bundle is invalid")
-	ErrRefBundleNotComplete = errors.New("a referenced bundle is not complete")
+	ErrRefBundleNotValid     = errors.New("a referenced bundle is invalid")
+	ErrRefBundleNotComplete  = errors.New("a referenced bundle is not complete")
+	ErrConeDiffNotConsistent = errors.New("cone diff is not consistent")
 )
 
 // CheckConsistencyOfConeAndMutateDiff checks whether cone referenced by the given tail transaction is consistent with the current diff.
 // this function mutates the approved, respectively walked transaction hashes and the diff with the cone diff,
 // in case the tail transaction is consistent with the latest ledger state.
-func CheckConsistencyOfConeAndMutateDiff(tailTxHash trinary.Hash, approved map[trinary.Hash]struct{}, diff map[trinary.Hash]int64) bool {
+func CheckConsistencyOfConeAndMutateDiff(tailTxHash trinary.Hash, approved map[trinary.Hash]struct{}, diff map[trinary.Hash]int64, forceRelease bool) bool {
 
 	// make a copy of approved, respectively visited transactions
 	visited := make(map[trinary.Hash]struct{}, len(approved))
@@ -26,9 +30,9 @@ func CheckConsistencyOfConeAndMutateDiff(tailTxHash trinary.Hash, approved map[t
 	}
 
 	// compute the diff of the cone which the transaction references
-	coneDiff, err := computeConeDiff(visited, tailTxHash, tangle.GetSolidMilestoneIndex())
+	coneDiff, err := computeConeDiff(visited, tailTxHash, tangle.GetSolidMilestoneIndex(), forceRelease)
 	if err != nil {
-		if err == ErrRefBundleNotValid {
+		if err == ErrRefBundleNotValid || err == ErrConeDiffNotConsistent {
 			// memorize for a certain time that this transaction references an invalid bundle
 			// to short circuit validation during a subsequent tip-sel on it again
 			PutInvalidBundleReference(tailTxHash)
@@ -48,6 +52,9 @@ func CheckConsistencyOfConeAndMutateDiff(tailTxHash trinary.Hash, approved map[t
 	// apply the walker diff to the cone diff
 	for addr, change := range diff {
 		coneDiff[addr] += change
+		if math.AbsInt64(coneDiff[addr]) > consts.TotalSupply {
+			return false
+		}
 	}
 
 	// the cone diff is now an aggregated mutation of the current walker plus the newly walked transaction's cone
@@ -61,6 +68,11 @@ func CheckConsistencyOfConeAndMutateDiff(tailTxHash trinary.Hash, approved map[t
 
 		// apply the latest ledger state's balance of the given address to the cone diff
 		change += int64(currentLedgerBalance)
+
+		if math.AbsInt64(change) > consts.TotalSupply {
+			// the mutation is not consistent with the current diff because the address would overflow/underflow from the total supply
+			return false
+		}
 
 		// the change reflects now a patched state representing the changes from the latest
 		// ledger state to the given transaction. if the balance is now negative, the cone diff is not
@@ -87,7 +99,22 @@ func CheckConsistencyOfConeAndMutateDiff(tailTxHash trinary.Hash, approved map[t
 
 // computes the diff of the cone by collecting all mutations of transactions directly/indirectly referenced by the given tail.
 // only the non yet visited transactions are collected
-func computeConeDiff(visited map[trinary.Hash]struct{}, tailTxHash trinary.Hash, latestSolidMilestoneIndex milestone_index.MilestoneIndex) (map[trinary.Trytes]int64, error) {
+func computeConeDiff(visited map[trinary.Hash]struct{}, tailTxHash trinary.Hash, latestSolidMilestoneIndex milestone.Index, forceRelease bool) (map[trinary.Trytes]int64, error) {
+
+	cachedTxs := make(map[trinary.Hash]*tangle.CachedTransaction)
+	cachedBndls := make(map[trinary.Hash]*tangle.CachedBundle)
+
+	defer func() {
+		// Release all bundles at the end
+		for _, cachedBndl := range cachedBndls {
+			cachedBndl.Release(forceRelease) // bundle -1
+		}
+
+		// Release all txs at the end
+		for _, cachedTx := range cachedTxs {
+			cachedTx.Release(forceRelease) // tx -1
+		}
+	}()
 
 	coneDiff := map[trinary.Trytes]int64{}
 	txsToTraverse := make(map[string]struct{})
@@ -108,58 +135,61 @@ func computeConeDiff(visited map[trinary.Hash]struct{}, tailTxHash trinary.Hash,
 				return nil, ErrRefBundleNotValid
 			}
 
-			cachedTx := tangle.GetCachedTransaction(txHash) // tx +1
-			if !cachedTx.Exists() {
-				log.Panicf("Tx with hash %v not found", txHash)
+			cachedTx, exists := cachedTxs[txHash]
+			if !exists {
+				cachedTx = tangle.GetCachedTransactionOrNil(txHash) // tx +1
+				if cachedTx == nil {
+					log.Panicf("Tx with hash %v not found", txHash)
+				}
+				cachedTxs[txHash] = cachedTx
 			}
 
 			// ledger update process is write locked
-			confirmed, at := cachedTx.GetTransaction().GetConfirmed()
+			confirmed, at := cachedTx.GetMetadata().GetConfirmed()
 			if confirmed {
 				if at > latestSolidMilestoneIndex {
 					log.Panicf("transaction %s was confirmed by a newer milestone %d", cachedTx.GetTransaction().GetHash(), at)
 				}
 				// only take transactions into account that have not been confirmed by the referenced or older milestones
-				cachedTx.Release() // tx -1
 				continue
 			}
 
-			// we only load up bundles when we're traversing tails, so we don't
-			// check the same bundle twice, however, we still add the trunk and branch of the
-			// bundle transaction to ensure, that if a transaction within the bundle would reference
-			// another trunk (as seen from the view of the bundle), we'd get that cone too.
-			if !cachedTx.GetTransaction().IsTail() {
-				txsToTraverse[cachedTx.GetTransaction().GetTrunk()] = struct{}{}
-				txsToTraverse[cachedTx.GetTransaction().GetBranch()] = struct{}{}
-				cachedTx.Release() // tx -1
-				continue
-			}
-
-			cachedBndl := tangle.GetBundleOfTailTransactionOrNil(cachedTx.GetTransaction().GetHash()) // bundle +1
-			if cachedBndl == nil {
-				cachedTx.Release() // tx -1
-				return nil, ErrRefBundleNotComplete
+			cachedBndl, exists := cachedBndls[txHash]
+			if !exists {
+				cachedBndl = tangle.GetCachedBundleOrNil(txHash) // bundle +1
+				if cachedBndl == nil {
+					return nil, ErrRefBundleNotComplete
+				}
+				cachedBndls[txHash] = cachedBndl
 			}
 
 			if !cachedBndl.GetBundle().IsValid() {
-				cachedTx.Release()   // tx -1
-				cachedBndl.Release() // bundle -1
+				return nil, ErrRefBundleNotValid
+			}
+
+			// note that through the stricter bundle validation rules, this
+			// check also ensures that the bundle is actually approving only tail transactions
+			if !cachedBndl.GetBundle().ValidStrictSemantics() {
 				return nil, ErrRefBundleNotValid
 			}
 
 			if !cachedBndl.GetBundle().IsValueSpam() {
-
 				ledgerChanges := cachedBndl.GetBundle().GetLedgerChanges()
 				for addr, change := range ledgerChanges {
 					coneDiff[addr] += change
+					if math.AbsInt64(coneDiff[addr]) > consts.TotalSupply {
+						// referenced bundle is not valid because ledger changes would overflow total supply
+						return nil, ErrConeDiffNotConsistent
+					}
 				}
 			}
 
-			txsToTraverse[cachedTx.GetTransaction().GetTrunk()] = struct{}{}
-			txsToTraverse[cachedTx.GetTransaction().GetBranch()] = struct{}{}
-
-			cachedTx.Release()   // tx -1
-			cachedBndl.Release() // bundle -1
+			// at this point the bundle is valid and therefore the trunk/branch of
+			// the head tx are tail transactions
+			cachedBndl.GetBundle().GetHead().ConsumeTransaction(func(headTx *hornet.Transaction, _ *hornet.TransactionMetadata) {
+				txsToTraverse[headTx.GetTrunk()] = struct{}{}
+				txsToTraverse[headTx.GetBranch()] = struct{}{}
+			})
 		}
 	}
 
