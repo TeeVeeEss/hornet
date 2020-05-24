@@ -219,8 +219,8 @@ type Metrics struct {
 type Info struct {
 	Peer                           *Peer  `json:"-"`
 	Address                        string `json:"address"`
-	Port                           uint16 `json:"port,omitempty"`
-	Domain                         string `json:"domain,omitempty"`
+	Port                           uint16 `json:"port"`
+	Domain                         string `json:"domain"`
 	DomainWithPort                 string `json:"-"`
 	Alias                          string `json:"alias,omitempty"`
 	PreferIPv6                     bool   `json:"-"`
@@ -240,5 +240,5 @@ type Info struct {
 	NumberOfDroppedSentPackets     uint32 `json:"numberOfDroppedSentPackets"`
 	ConnectionType                 string `json:"connectionType"`
 	Connected                      bool   `json:"connected"`
-	AutopeeringID                  string `json:"autopeeringId,omitempty"`
+	AutopeeringID                  string `json:"autopeeringId"`
 }
