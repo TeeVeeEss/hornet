@@ -189,7 +189,7 @@ func (m *Manager) Whitelist(ips []string, port uint16, autopeeringPeer ...*autop
 		if len(autopeeringPeer) > 0 {
 			m.whitelist[id] = autopeeringPeer[0]
 		} else {
-			m.whitelist[id] = nil
+			m.whitelist[id] = "none"
 		}
 		m.BlacklistRemove(ip)
 	}
@@ -237,6 +237,7 @@ func (m *Manager) PeerInfos() []*peer.Info {
 		addrStr := fmt.Sprintf("%s:%d", originAddr.Addr, originAddr.Port)
 		info := &peer.Info{
 			Address:        addrStr,
+			Port:           originAddr.Port,
 			Domain:         originAddr.Addr,
 			DomainWithPort: addrStr,
 			Alias:          originAddr.Alias,
@@ -244,7 +245,7 @@ func (m *Manager) PeerInfos() []*peer.Info {
 			Connected:      false,
 			PreferIPv6:     originAddr.PreferIPv6,
 		}
-		if reconnectInfo.Autopeering != nil {
+		if reconnectInfo.Autopeering != "none" {
 			info.AutopeeringID = reconnectInfo.Autopeering.ID().String()
 		}
 		infos = append(infos, info)
