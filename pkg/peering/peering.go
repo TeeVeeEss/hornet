@@ -230,6 +230,12 @@ func (m *Manager) PeerInfos() []*peer.Info {
 	for _, p := range m.connected {
 		info := p.Info()
 		info.Connected = true
+		if info.Autopeering = nil {
+			info.AutopeeringID = "none"
+		}
+		if info.Autopeering = !nil {
+			info.Alias = "none"
+		}
 		infos = append(infos, info)
 	}
 	for _, reconnectInfo := range m.reconnect {
@@ -247,6 +253,7 @@ func (m *Manager) PeerInfos() []*peer.Info {
 		}
 		if reconnectInfo.Autopeering != nil {
 			info.AutopeeringID = reconnectInfo.Autopeering.ID().String()
+			info.Alias         = "none"
 		}
 		infos = append(infos, info)
 	}
