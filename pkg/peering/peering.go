@@ -189,7 +189,7 @@ func (m *Manager) Whitelist(ips []string, port uint16, autopeeringPeer ...*autop
 		if len(autopeeringPeer) > 0 {
 			m.whitelist[id] = autopeeringPeer[0]
 		} else {
-			m.whitelist[id] = nil
+			m.whitelist[id] = "none"
 		}
 		m.BlacklistRemove(ip)
 	}
@@ -230,10 +230,10 @@ func (m *Manager) PeerInfos() []*peer.Info {
 	for _, p := range m.connected {
 		info := p.Info()
 		info.Connected = true
-		if info.Autopeering == nil {
+		if info.Autopeering == "none" {
 			info.AutopeeringID = "none"
 		}
-		if info.Autopeering == !nil {
+		if info.Autopeering != "none" {
 			info.Alias = "none"
 		}
 		infos = append(infos, info)
