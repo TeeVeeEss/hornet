@@ -237,6 +237,7 @@ func (m *Manager) PeerInfos() []*peer.Info {
 		addrStr := fmt.Sprintf("%s:%d", originAddr.Addr, originAddr.Port)
 		info := &peer.Info{
 			Address:        addrStr,
+			Port:           originAddr.Port,
 			Domain:         originAddr.Addr,
 			DomainWithPort: addrStr,
 			Alias:          originAddr.Alias,
