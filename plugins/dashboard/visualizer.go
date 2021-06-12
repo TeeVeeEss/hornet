@@ -1,195 +1,204 @@
 package dashboard
 
 import (
-	"github.com/iotaledger/hive.go/daemon"
-	"github.com/iotaledger/hive.go/events"
-	"github.com/iotaledger/hive.go/workerpool"
-
 	"github.com/gohornet/hornet/pkg/model/hornet"
 	"github.com/gohornet/hornet/pkg/model/milestone"
-	tanglePackage "github.com/gohornet/hornet/pkg/model/tangle"
-	tanglemodel "github.com/gohornet/hornet/pkg/model/tangle"
+	"github.com/gohornet/hornet/pkg/model/storage"
 	"github.com/gohornet/hornet/pkg/shutdown"
-	"github.com/gohornet/hornet/plugins/tangle"
+	"github.com/gohornet/hornet/pkg/tipselect"
+	"github.com/gohornet/hornet/pkg/whiteflag"
+	coordinatorPlugin "github.com/gohornet/hornet/plugins/coordinator"
+	"github.com/iotaledger/hive.go/events"
 )
 
 const (
-	VisualizerIdLength = 5
-)
-
-var (
-	visualizerWorkerCount     = 1
-	visualizerWorkerQueueSize = 500
-	visualizerWorkerPool      *workerpool.WorkerPool
+	VisualizerIdLength = 7
 )
 
 // vertex defines a vertex in a DAG.
 type vertex struct {
-	ID          string `json:"id"`
-	Tag         string `json:"tag"`
-	TrunkID     string `json:"trunk_id"`
-	BranchID    string `json:"branch_id"`
-	IsSolid     bool   `json:"is_solid"`
-	IsConfirmed bool   `json:"is_confirmed"`
-	IsMilestone bool   `json:"is_milestone"`
-	IsTip       bool   `json:"is_tip"`
+	ID           string   `json:"id"`
+	Parents      []string `json:"parents"`
+	IsSolid      bool     `json:"is_solid"`
+	IsReferenced bool     `json:"is_referenced"`
+	IsMilestone  bool     `json:"is_milestone"`
+	IsTip        bool     `json:"is_tip"`
 }
 
-// metainfo signals that metadata of a given transaction changed.
+// metainfo signals that metadata of a given message changed.
 type metainfo struct {
 	ID string `json:"id"`
 }
 
-// confirmationinfo signals confirmation of a milestone tail tx with a list of exluded txs in the past cone.
+// confirmationinfo signals confirmation of a milestone msg with a list of exluded msgs in the past cone.
 type confirmationinfo struct {
 	ID          string   `json:"id"`
 	ExcludedIDs []string `json:"excluded_ids"`
 }
 
-/*
-// tipinfo holds information about whether a given transaction is a tip or not.
+// tipinfo holds information about whether a given message is a tip or not.
 type tipinfo struct {
 	ID    string `json:"id"`
 	IsTip bool   `json:"is_tip"`
 }
-*/
-
-func configureVisualizer() {
-	visualizerWorkerPool = workerpool.New(func(task workerpool.Task) {
-		hub.BroadcastMsg(task.Param(0), task.Param(1).(bool))
-		task.Return(nil)
-	}, workerpool.WorkerCount(visualizerWorkerCount), workerpool.QueueSize(visualizerWorkerQueueSize))
-}
 
 func runVisualizer() {
 
-	notifyNewVertex := events.NewClosure(func(cachedTx *tanglemodel.CachedTransaction, latestMilestoneIndex milestone.Index, latestSolidMilestoneIndex milestone.Index) {
-		cachedTx.ConsumeTransaction(func(tx *hornet.Transaction, metadata *hornet.TransactionMetadata) { // tx -1
-			if !tanglemodel.IsNodeSyncedWithThreshold() {
+	onReceivedNewMessage := events.NewClosure(func(cachedMsg *storage.CachedMessage, latestMilestoneIndex milestone.Index, confirmedMilestoneIndex milestone.Index) {
+		cachedMsg.ConsumeMessageAndMetadata(func(msg *storage.Message, metadata *storage.MessageMetadata) { // msg -1
+			if !deps.Storage.IsNodeAlmostSynced() {
 				return
 			}
 
-			visualizerWorkerPool.TrySubmit(
-				&msg{
+			parentsHex := make([]string, len(msg.GetParents()))
+			for i, parent := range msg.GetParents() {
+				parentsHex[i] = parent.ToHex()[:VisualizerIdLength]
+			}
+
+			hub.BroadcastMsg(
+				&Msg{
 					Type: MsgTypeVertex,
 					Data: &vertex{
-						ID:          tx.GetHash(),
-						Tag:         tx.Tx.Tag,
-						TrunkID:     tx.GetTrunk()[:VisualizerIdLength],
-						BranchID:    tx.GetBranch()[:VisualizerIdLength],
-						IsSolid:     metadata.IsSolid(),
-						IsConfirmed: metadata.IsConfirmed(),
-						IsMilestone: false,
-						IsTip:       false,
+						ID:           msg.GetMessageID().ToHex(),
+						Parents:      parentsHex,
+						IsSolid:      metadata.IsSolid(),
+						IsReferenced: metadata.IsReferenced(),
+						IsMilestone:  false,
+						IsTip:        false,
 					},
-				}, false)
+				},
+			)
 		})
 	})
 
-	notifySolidInfo := events.NewClosure(func(cachedTx *tanglePackage.CachedTransaction) {
-		cachedTx.ConsumeTransaction(func(tx *hornet.Transaction, metadata *hornet.TransactionMetadata) { // tx -1
-			if !tanglemodel.IsNodeSyncedWithThreshold() {
+	onMessageSolid := events.NewClosure(func(cachedMsgMeta *storage.CachedMetadata) {
+		cachedMsgMeta.ConsumeMetadata(func(metadata *storage.MessageMetadata) { // metadata -1
+
+			if !deps.Storage.IsNodeAlmostSynced() {
 				return
 			}
 
-			visualizerWorkerPool.TrySubmit(
-				&msg{
+			hub.BroadcastMsg(
+				&Msg{
 					Type: MsgTypeSolidInfo,
 					Data: &metainfo{
-						ID: tx.GetHash()[:VisualizerIdLength],
+						ID: cachedMsgMeta.GetMetadata().GetMessageID().ToHex()[:VisualizerIdLength],
 					},
-				}, false)
+				},
+			)
 		})
 	})
 
-	notifyMilestoneInfo := events.NewClosure(func(cachedBndl *tanglePackage.CachedBundle) {
-		cachedBndl.ConsumeBundle(func(bndl *tanglePackage.Bundle) { // bundle -1
-			if !tanglemodel.IsNodeSyncedWithThreshold() {
-				return
-			}
+	onReceivedNewMilestone := events.NewClosure(func(cachedMilestone *storage.CachedMilestone) {
+		defer cachedMilestone.Release(true) // milestone -1
 
-			for _, txHash := range bndl.GetTransactionHashes() {
-				visualizerWorkerPool.TrySubmit(
-					&msg{
-						Type: MsgTypeMilestoneInfo,
-						Data: &metainfo{
-							ID: txHash[:VisualizerIdLength],
-						},
-					}, false)
-			}
-		})
+		if !deps.Storage.IsNodeAlmostSynced() {
+			return
+		}
+
+		hub.BroadcastMsg(
+			&Msg{
+				Type: MsgTypeMilestoneInfo,
+				Data: &metainfo{
+					ID: cachedMilestone.GetMilestone().MessageID.ToHex()[:VisualizerIdLength],
+				},
+			},
+		)
 	})
 
-	notifyConfirmedInfo := events.NewClosure(func(cachedBndl *tanglePackage.CachedBundle) {
-		cachedBndl.ConsumeBundle(func(bndl *tanglePackage.Bundle) { // bundle -1
-			if !tanglemodel.IsNodeSyncedWithThreshold() {
-				return
-			}
+	// show checkpoints as milestones in the coordinator node
+	onIssuedCheckpointMessage := events.NewClosure(func(checkpointIndex int, tipIndex int, tipsTotal int, messageID hornet.MessageID) {
+		if !deps.Storage.IsNodeAlmostSynced() {
+			return
+		}
 
-			visualizerWorkerPool.TrySubmit(
-				&msg{
-					Type: MsgTypeConfirmedInfo,
-					Data: &confirmationinfo{
-						ID:          bndl.GetTailHash()[:VisualizerIdLength],
-						ExcludedIDs: make([]string, 0),
-					},
-				}, false)
-		})
+		hub.BroadcastMsg(
+			&Msg{
+				Type: MsgTypeMilestoneInfo,
+				Data: &metainfo{
+					ID: messageID.ToHex()[:VisualizerIdLength],
+				},
+			},
+		)
 	})
 
-	/*
-		notifyTipAdded := events.NewClosure(func(txHash trinary.Hash) {
-			if !tanglemodel.IsNodeSyncedWithThreshold() {
-				return
-			}
+	onMilestoneConfirmed := events.NewClosure(func(confirmation *whiteflag.Confirmation) {
+		if !deps.Storage.IsNodeAlmostSynced() {
+			return
+		}
 
-			visualizerWorkerPool.TrySubmit(
-				&msg{
-					Type: MsgTypeTipInfo,
-					Data: &tipinfo{
-						ID:    txHash[:VisualizerIdLength],
-						IsTip: true,
-					},
-				}, true)
-		})
+		excludedIDs := make([]string, len(confirmation.Mutations.MessagesExcludedWithConflictingTransactions))
+		for i, messageID := range confirmation.Mutations.MessagesExcludedWithConflictingTransactions {
+			excludedIDs[i] = messageID.MessageID.ToHex()[:VisualizerIdLength]
+		}
 
-		notifyTipRemoved := events.NewClosure(func(txHash trinary.Hash) {
-			if !tanglemodel.IsNodeSyncedWithThreshold() {
-				return
-			}
+		hub.BroadcastMsg(
+			&Msg{
+				Type: MsgTypeConfirmedInfo,
+				Data: &confirmationinfo{
+					ID:          confirmation.MilestoneMessageID.ToHex()[:VisualizerIdLength],
+					ExcludedIDs: excludedIDs,
+				},
+			},
+		)
+	})
 
-			visualizerWorkerPool.TrySubmit(
-				&msg{
-					Type: MsgTypeTipInfo,
-					Data: &tipinfo{
-						ID:    txHash[:VisualizerIdLength],
-						IsTip: false,
-					},
-				}, true)
-		})
-	*/
+	onTipAdded := events.NewClosure(func(tip *tipselect.Tip) {
+		if !deps.Storage.IsNodeAlmostSynced() {
+			return
+		}
 
-	daemon.BackgroundWorker("Dashboard[Visualizer]", func(shutdownSignal <-chan struct{}) {
-		tangle.Events.ReceivedNewTransaction.Attach(notifyNewVertex)
-		defer tangle.Events.ReceivedNewTransaction.Detach(notifyNewVertex)
-		tangle.Events.TransactionSolid.Attach(notifySolidInfo)
-		defer tangle.Events.TransactionSolid.Detach(notifySolidInfo)
-		tangle.Events.ReceivedNewMilestone.Attach(notifyMilestoneInfo)
-		defer tangle.Events.ReceivedNewMilestone.Detach(notifyMilestoneInfo)
-		tangle.Events.SolidMilestoneChanged.Attach(notifyConfirmedInfo)
-		defer tangle.Events.SolidMilestoneChanged.Detach(notifyConfirmedInfo)
-		/*
-			tangle.Events.TipAdded.Attach(notifyTipAdded)
-			defer tangle.Events.TipAdded.Detach(notifyTipAdded)
-			tangle.Events.TipRemoved.Attach(notifyTipRemoved)
-			defer tangle.Events.TipRemoved.Detach(notifyTipRemoved)
-		*/
+		hub.BroadcastMsg(
+			&Msg{
+				Type: MsgTypeTipInfo,
+				Data: &tipinfo{
+					ID:    tip.MessageID.ToHex()[:VisualizerIdLength],
+					IsTip: true,
+				},
+			},
+		)
+	})
 
-		visualizerWorkerPool.Start()
+	onTipRemoved := events.NewClosure(func(tip *tipselect.Tip) {
+		if !deps.Storage.IsNodeAlmostSynced() {
+			return
+		}
+
+		hub.BroadcastMsg(
+			&Msg{
+				Type: MsgTypeTipInfo,
+				Data: &tipinfo{
+					ID:    tip.MessageID.ToHex()[:VisualizerIdLength],
+					IsTip: false,
+				},
+			},
+		)
+	})
+
+	Plugin.Daemon().BackgroundWorker("Dashboard[Visualizer]", func(shutdownSignal <-chan struct{}) {
+		deps.Tangle.Events.ReceivedNewMessage.Attach(onReceivedNewMessage)
+		defer deps.Tangle.Events.ReceivedNewMessage.Detach(onReceivedNewMessage)
+		deps.Tangle.Events.MessageSolid.Attach(onMessageSolid)
+		defer deps.Tangle.Events.MessageSolid.Detach(onMessageSolid)
+		deps.Tangle.Events.ReceivedNewMilestone.Attach(onReceivedNewMilestone)
+		defer deps.Tangle.Events.ReceivedNewMilestone.Detach(onReceivedNewMilestone)
+		if cooEvents := coordinatorPlugin.GetEvents(); cooEvents != nil {
+			cooEvents.IssuedCheckpointMessage.Attach(onIssuedCheckpointMessage)
+			defer cooEvents.IssuedCheckpointMessage.Detach(onIssuedCheckpointMessage)
+		}
+		deps.Tangle.Events.MilestoneConfirmed.Attach(onMilestoneConfirmed)
+		defer deps.Tangle.Events.MilestoneConfirmed.Detach(onMilestoneConfirmed)
+
+		if deps.TipSelector != nil {
+			deps.TipSelector.Events.TipAdded.Attach(onTipAdded)
+			defer deps.TipSelector.Events.TipAdded.Detach(onTipAdded)
+			deps.TipSelector.Events.TipRemoved.Attach(onTipRemoved)
+			defer deps.TipSelector.Events.TipRemoved.Detach(onTipRemoved)
+		}
+
 		<-shutdownSignal
 
 		log.Info("Stopping Dashboard[Visualizer] ...")
-		visualizerWorkerPool.StopAndWait()
 		log.Info("Stopping Dashboard[Visualizer] ... done")
 	}, shutdown.PriorityDashboard)
 }

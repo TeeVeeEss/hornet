@@ -11,37 +11,36 @@
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 
-# Project files
-.idea
+# IDE related files
+.vscode/
+.idea/
 
-# Database directory
-mainnetdb/
-comnetdb/
+# dist packages
+dist/
 
 # OSX related files
 .DS_Store
 /hornet
 
-# snapshot files
-*export.bin
-*export_comnet.bin
+# Database directory
+privatedb*/
+comnetdb*/
+devnetdb*/
+testnetdb*/
+mainnetdb*/
+p2pstore*/
 
-# template files
-*node_modules
-*build
-plugins/monitor/tanglemonitor
-
-# dist packages
-dist/
-
-# Snapshot directory (for docker running in main path)
-snapshot/
+# snapshot dir
+snapshots/
 
 # log files
 hornet.log
+integration-tests/logs/*.log
+integration-tests/logs/*.html
+integration-tests/logs/*.profile
 
 # coordinator files
-layer*.csv
 coordinator.state
-coordinator.tree
-hive.go/
+
+# Docs
+book

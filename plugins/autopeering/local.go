@@ -1,107 +1,98 @@
 package autopeering
 
 import (
-	"encoding/base64"
 	"net"
 	"strconv"
 
+	"github.com/multiformats/go-multiaddr"
 	"go.etcd.io/bbolt"
+
+	"github.com/gohornet/hornet/core/p2p"
 
 	"github.com/iotaledger/hive.go/autopeering/peer"
 	"github.com/iotaledger/hive.go/autopeering/peer/service"
-	"github.com/iotaledger/hive.go/crypto/ed25519"
 	"github.com/iotaledger/hive.go/kvstore/bolt"
 	"github.com/iotaledger/hive.go/logger"
-
-	"github.com/gohornet/hornet/pkg/autopeering/services"
-	"github.com/gohornet/hornet/pkg/config"
-	"github.com/gohornet/hornet/pkg/model/tangle"
 )
 
+// Local defines the local autopeering peer.
 type Local struct {
 	PeerLocal *peer.Local
 	boltDb    *bbolt.DB
 	peerDb    *peer.DB
 }
 
-func NewLocal() *Local {
+func newLocal(seed []byte) *Local {
 	log := logger.NewLogger("Local")
 
-	var peeringIP net.IP
-
 	// let the autopeering discover the IP
-	if config.NodeConfig.GetBool(config.CfgNetPreferIPv6) {
-		peeringIP = net.IPv6unspecified
-	} else {
-		peeringIP = net.IPv4zero
+	// TODO: is this really necessary?
+	var peeringIP net.IP
+	bindAddr := deps.NodeConfig.Strings(p2p.CfgP2PBindMultiAddresses)[0]
+	multiAddrBindAddr, err := multiaddr.NewMultiaddr(bindAddr)
+	if err != nil {
+		log.Fatalf("unable to parse bind multi address %s", err)
+		return nil
+	}
+	for _, proto := range multiAddrBindAddr.Protocols() {
+		switch proto.Code {
+		case multiaddr.P_IP4:
+			peeringIP = net.IPv4zero
+		case multiaddr.P_IP6:
+			peeringIP = net.IPv6unspecified
+		}
 	}
 
-	_, peeringPortStr, err := net.SplitHostPort(config.NodeConfig.GetString(config.CfgNetAutopeeringBindAddr))
+	_, peeringPortStr, err := net.SplitHostPort(deps.NodeConfig.String(CfgNetAutopeeringBindAddr))
 	if err != nil {
 		log.Fatalf("autopeering bind address is invalid: %s", err)
 	}
 
 	peeringPort, err := strconv.Atoi(peeringPortStr)
 	if err != nil {
-		log.Fatalf("Invalid autopeering port number: %s, Error: %s", peeringPortStr, err)
+		log.Fatalf("invalid autopeering port number: %s, Error: %s", peeringPortStr, err)
 	}
 
-	// announce the peering service
+	// announce the autopeering service
 	ownServices := service.New()
 	ownServices.Update(service.PeeringKey, "udp", peeringPort)
 
-	if !config.NodeConfig.GetBool(config.CfgNetAutopeeringRunAsEntryNode) {
-		_, gossipBindAddrPortStr, err := net.SplitHostPort(config.NodeConfig.GetString(config.CfgNetGossipBindAddress))
+	if !deps.NodeConfig.Bool(CfgNetAutopeeringRunAsEntryNode) {
+		libp2pBindPortStr, err := multiAddrBindAddr.ValueForProtocol(multiaddr.P_TCP)
 		if err != nil {
-			log.Fatalf("gossip bind address is invalid: %s", err)
+			log.Fatalf("unable to extract libp2p bind port from multi address: %s", err)
 		}
 
-		gossipBindAddrPort, err := strconv.Atoi(gossipBindAddrPortStr)
+		libp2pBindPort, err := strconv.Atoi(libp2pBindPortStr)
 		if err != nil {
-			log.Fatalf("Invalid gossip port number: %s, Error: %s", gossipBindAddrPort, err)
+			log.Fatalf("invalid libp2p bind port '%s': %s", libp2pBindPortStr, err)
 		}
 
-		ownServices.Update(services.GossipServiceKey(), "tcp", gossipBindAddrPort)
+		ownServices.Update(p2pServiceKey(), "tcp", libp2pBindPort)
 	}
 
-	// set the private key from the seed provided in the config
-	var seed [][]byte
-	if str := config.NodeConfig.GetString(config.CfgNetAutopeeringSeed); str != "" {
-		bytes, err := base64.StdEncoding.DecodeString(str)
-		if err != nil {
-			log.Fatalf("Invalid %s: %s", config.CfgNetAutopeeringSeed, err)
-		}
-		if l := len(bytes); l != ed25519.SeedSize {
-			log.Fatalf("Invalid %s length: %d, need %d", config.CfgNetAutopeeringSeed, l, ed25519.SeedSize)
-		}
-		seed = append(seed, bytes)
-	}
-
-	boltDb, err := bolt.CreateDB(config.NodeConfig.GetString(config.CfgDatabasePath), "peer.db")
+	boltDb, err := bolt.CreateDB(deps.NodeConfig.String(CfgNetAutopeeringDatabaseDirPath), "autopeering.db")
 	if err != nil {
-		log.Fatalf("Unable to create autopeering database: %s", err)
+		log.Fatalf("unable to create autopeering database: %s", err)
 	}
 
-	peerDB, err := peer.NewDB(bolt.New(boltDb).WithRealm([]byte{tangle.StorePrefixAutopeering}))
+	// realm doesn't matter
+	peerDB, err := peer.NewDB(bolt.New(boltDb))
 	if err != nil {
-		log.Fatalf("Unable to create autopeering database: %s", err)
+		log.Fatalf("unable to create autopeering database: %s", err)
 	}
 
-	local, err := peer.NewLocal(peeringIP, ownServices, peerDB, seed...)
+	local, err := peer.NewLocal(peeringIP, ownServices, peerDB, [][]byte{seed}...)
 	if err != nil {
-		log.Fatalf("Error creating local: %s", err)
+		log.Fatalf("unable to create local autopeering peer instance: %s", err)
 	}
 
-	log.Infof("Initialized local: peer://%s@%s", base64.StdEncoding.EncodeToString(local.PublicKey().Bytes()), local.Address())
+	log.Infof("Initialized local autopeering: %s@%s", local.PublicKey(), local.Address())
 
-	return &Local{
-		PeerLocal: local,
-		boltDb:    boltDb,
-		peerDb:    peerDB,
-	}
+	return &Local{PeerLocal: local, boltDb: boltDb, peerDb: peerDB}
 }
 
-func (l *Local) Close() error {
+func (l *Local) close() error {
 	l.peerDb.Close()
 	return l.boltDb.Close()
 }

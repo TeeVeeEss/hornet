@@ -1,24 +1,31 @@
 name: Test HORNET
 on:
   push:
+    paths-ignore:
+      - 'docs/**'
     branches:
-      - master
+      - main
       - develop
   pull_request:
+    paths-ignore:
+      - 'docs/**'
 
 jobs:
   test:
     name: Test HORNET
     runs-on: ubuntu-latest
     steps:
-      - name: Set up Go 1.14
+      - name: Set up Go
         uses: actions/setup-go@v1
         with:
-          go-version: 1.14
+          go-version: 1.16
         id: go
 
       - name: Print Go version
         run: go version
+
+      - name: Install Build Essential
+        run: sudo apt update && sudo apt install build-essential -y
 
       - name: Check out code into the Go module directory
         uses: actions/checkout@v2
@@ -28,4 +35,4 @@ jobs:
         with:
           timeout_minutes: 5
           max_attempts: 3
-          command: go test ./...
+          command: go test `go list ./... | grep -v -e integration-tests -e testsuite -e whiteflag`

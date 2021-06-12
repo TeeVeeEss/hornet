@@ -4,50 +4,46 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/iotaledger/hive.go/daemon"
+	"github.com/gohornet/hornet/core/database"
+	"github.com/gohornet/hornet/pkg/shutdown"
 	"github.com/iotaledger/hive.go/events"
 	"github.com/iotaledger/hive.go/timeutil"
-
-	"github.com/gohornet/hornet/pkg/model/tangle"
-	"github.com/gohornet/hornet/pkg/shutdown"
-	"github.com/gohornet/hornet/plugins/database"
 )
 
 var (
 	lastDbCleanup       = &database.DatabaseCleanup{}
-	cachedDbSizeMetrics []*dbSize
+	cachedDbSizeMetrics []*DBSizeMetric
 )
 
-type dbSize struct {
-	Tangle   int64
+// DBSizeMetric represents database size metrics.
+type DBSizeMetric struct {
+	Total    int64
 	Snapshot int64
-	Spent    int64
 	Time     time.Time
 }
 
-func (s *dbSize) MarshalJSON() ([]byte, error) {
+func (s *DBSizeMetric) MarshalJSON() ([]byte, error) {
 	size := struct {
-		Tangle   int64 `json:"tangle"`
-		Snapshot int64 `json:"snapshot"`
-		Spent    int64 `json:"spent"`
-		Time     int64 `json:"ts"`
+		Total int64 `json:"total"`
+		Time  int64 `json:"ts"`
 	}{
-		Tangle:   s.Tangle,
-		Snapshot: s.Snapshot,
-		Spent:    s.Spent,
-		Time:     s.Time.Unix(),
+		Total: s.Total,
+		Time:  s.Time.Unix(),
 	}
 
 	return json.Marshal(size)
 }
 
-func currentDatabaseSize() *dbSize {
-	tangle, snapshot, spent := tangle.GetDatabaseSizes()
-	newValue := &dbSize{
-		Tangle:   tangle,
-		Snapshot: snapshot,
-		Spent:    spent,
-		Time:     time.Now(),
+func currentDatabaseSize() *DBSizeMetric {
+	dbSize, err := deps.Storage.GetDatabaseSize()
+	if err != nil {
+		log.Warnf("error in GetDatabaseSize: %s", err)
+		return nil
+	}
+
+	newValue := &DBSizeMetric{
+		Total: dbSize,
+		Time:  time.Now(),
 	}
 	cachedDbSizeMetrics = append(cachedDbSizeMetrics, newValue)
 	if len(cachedDbSizeMetrics) > 600 {
@@ -61,17 +57,19 @@ func runDatabaseSizeCollector() {
 	// Gather first metric so we have a starting point
 	currentDatabaseSize()
 
-	notifyDatabaseCleanup := events.NewClosure(func(cleanup *database.DatabaseCleanup) {
+	onDatabaseCleanup := events.NewClosure(func(cleanup *database.DatabaseCleanup) {
 		lastDbCleanup = cleanup
-		wsSendWorkerPool.TrySubmit(cleanup)
+		hub.BroadcastMsg(&Msg{Type: MsgTypeDatabaseCleanupEvent, Data: cleanup})
 	})
 
-	daemon.BackgroundWorker("Dashboard[DBSize]", func(shutdownSignal <-chan struct{}) {
-		database.Events.DatabaseCleanup.Attach(notifyDatabaseCleanup)
-		timeutil.Ticker(func() {
+	Plugin.Daemon().BackgroundWorker("Dashboard[DBSize]", func(shutdownSignal <-chan struct{}) {
+		deps.DatabaseEvents.DatabaseCleanup.Attach(onDatabaseCleanup)
+		defer deps.DatabaseEvents.DatabaseCleanup.Detach(onDatabaseCleanup)
+
+		ticker := timeutil.NewTicker(func() {
 			dbSizeMetric := currentDatabaseSize()
-			wsSendWorkerPool.TrySubmit([]*dbSize{dbSizeMetric})
+			hub.BroadcastMsg(&Msg{Type: MsgTypeDatabaseSizeMetric, Data: []*DBSizeMetric{dbSizeMetric}})
 		}, 1*time.Minute, shutdownSignal)
-		database.Events.DatabaseCleanup.Detach(notifyDatabaseCleanup)
+		ticker.WaitForGracefulShutdown()
 	}, shutdown.PriorityDashboard)
 }

@@ -1,24 +1,23 @@
 package spammer
 
 import (
-	"errors"
 	"math/rand"
 	"runtime"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/shirou/gopsutil/cpu"
 
-	"github.com/iotaledger/hive.go/syncutils"
+	"github.com/gohornet/hornet/pkg/common"
+)
+
+const (
+	cpuUsageSampleTime = 200 * time.Millisecond
+	cpuUsageSleepTime  = int(200 * time.Millisecond)
 )
 
 var (
-	cpuUsageSampleTime = 200 * time.Millisecond
-	cpuUsageSleepTime  = int(200 * time.Millisecond)
-
-	cpuUsageLock   syncutils.RWMutex
-	cpuUsageResult float64
-	cpuUsageError  error
-
+	// ErrCPUPercentageUnknown is returned if the CPU usage couldn't be determined.
 	ErrCPUPercentageUnknown = errors.New("CPU percentage unknown")
 )
 
@@ -26,6 +25,10 @@ var (
 func cpuUsageUpdater() {
 	go func() {
 		for {
+			if Plugin.Daemon().IsStopped() {
+				return
+			}
+
 			cpuUsagePSutil, err := cpu.Percent(cpuUsageSampleTime, false)
 			cpuUsageLock.Lock()
 			if err != nil {
@@ -59,7 +62,7 @@ func cpuUsageGuessWithAdditionalWorker() (float64, error) {
 }
 
 // waitForLowerCPUUsage waits until the cpu usage drops below cpuMaxUsage.
-func waitForLowerCPUUsage() error {
+func waitForLowerCPUUsage(cpuMaxUsage float64, shutdownSignal <-chan struct{}) error {
 	if cpuMaxUsage == 0.0 {
 		return nil
 	}
@@ -72,6 +75,12 @@ func waitForLowerCPUUsage() error {
 
 		if cpuUsage < cpuMaxUsage {
 			break
+		}
+
+		select {
+		case <-shutdownSignal:
+			return common.ErrOperationAborted
+		default:
 		}
 
 		// sleep a random time between cpuUsageSleepTime and 2*cpuUsageSleepTime

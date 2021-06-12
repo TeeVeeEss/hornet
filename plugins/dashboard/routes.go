@@ -2,56 +2,161 @@ package dashboard
 
 import (
 	"fmt"
-	"io/ioutil"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
 
 	"github.com/gobuffalo/packr/v2"
-	"github.com/iotaledger/hive.go/websockethub"
 	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
 	"github.com/pkg/errors"
+	"golang.org/x/time/rate"
 
-	"github.com/gohornet/hornet/pkg/config"
-	"github.com/gohornet/hornet/pkg/model/tangle"
+	"github.com/gohornet/hornet/pkg/jwt"
+	"github.com/gohornet/hornet/plugins/restapi"
 )
 
-// ErrInvalidParameter defines the invalid parameter error.
-var ErrInvalidParameter = errors.New("invalid parameter")
+const (
+	WebsocketCmdRegister   = 0
+	WebsocketCmdUnregister = 1
+)
 
-// ErrInternalError defines the internal error.
-var ErrInternalError = errors.New("internal error")
+var (
+	// ErrInvalidParameter defines the invalid parameter error.
+	ErrInvalidParameter = echo.ErrBadRequest
 
-// ErrNotFound defines the not found error.
-var ErrNotFound = errors.New("not found")
+	// ErrInternalError defines the internal error.
+	ErrInternalError = echo.ErrInternalServerError
 
-// ErrForbidden defines the forbidden error.
-var ErrForbidden = errors.New("forbidden")
+	// ErrNotFound defines the not found error.
+	ErrNotFound = echo.ErrNotFound
 
-// holds dashboard assets
-var appBox = packr.New("Dashboard_App", "./frontend/build")
-var assetsBox = packr.New("Dashboard_Assets", "./frontend/src/assets")
+	// ErrForbidden defines the forbidden error.
+	ErrForbidden = echo.ErrForbidden
 
-func indexRoute(e echo.Context) error {
-	if config.NodeConfig.GetBool(config.CfgDashboardDevMode) {
-		res, err := http.Get("http://127.0.0.1:9090/")
-		if err != nil {
-			return err
+	// holds dashboard assets
+	appBox = packr.New("Dashboard_App", "./frontend/build")
+)
+
+func appBoxMiddleware() echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) (err error) {
+			contentType := calculateMimeType(c)
+
+			path := strings.TrimPrefix(c.Request().URL.Path, "/")
+			if len(path) == 0 {
+				path = "index.html"
+				contentType = echo.MIMETextHTMLCharsetUTF8
+			}
+			staticBlob, err := appBox.Find(path)
+			if err != nil {
+				// If the asset cannot be found, fall back to the index.html for routing
+				path = "index.html"
+				contentType = echo.MIMETextHTMLCharsetUTF8
+				staticBlob, err = appBox.Find(path)
+				if err != nil {
+					return next(c)
+				}
+			}
+			return c.Blob(http.StatusOK, contentType, staticBlob)
 		}
-		devIndexHTML, err := ioutil.ReadAll(res.Body)
-		if err != nil {
-			return err
-		}
-		return e.HTMLBlob(http.StatusOK, devIndexHTML)
 	}
-	theme := config.NodeConfig.GetString(config.CfgDashboardTheme)
-	indexHTML, err := appBox.Find("index.html")
-	if theme == "light" {
-		indexHTML, err = appBox.Find("index_light.html")
-	}
+}
+
+func devModeReverseProxyMiddleware() echo.MiddlewareFunc {
+
+	apiUrl, err := url.Parse("http://127.0.0.1:9090")
 	if err != nil {
-		return err
+		log.Fatalf("wrong devmode url: %s", err)
 	}
-	return e.HTMLBlob(http.StatusOK, indexHTML)
+
+	return middleware.Proxy(middleware.NewRoundRobinBalancer([]*middleware.ProxyTarget{
+		{
+			URL: apiUrl,
+		},
+	}))
+}
+
+func apiMiddlewares() []echo.MiddlewareFunc {
+
+	proxySkipper := func(context echo.Context) bool {
+		// Only proxy allowed routes, skip all others
+		return !deps.DashboardAllowedAPIRoute(context)
+	}
+
+	apiBindAddr := deps.NodeConfig.String(restapi.CfgRestAPIBindAddress)
+	_, apiBindPort, err := net.SplitHostPort(apiBindAddr)
+	if err != nil {
+		log.Fatalf("wrong REST API bind address: %s", err)
+	}
+
+	apiURL, err := url.Parse(fmt.Sprintf("http://localhost:%s", apiBindPort))
+	if err != nil {
+		log.Fatalf("wrong dashboard API url: %s", err)
+	}
+
+	balancer := middleware.NewRoundRobinBalancer([]*middleware.ProxyTarget{
+		{
+			URL: apiURL,
+		},
+	})
+
+	config := middleware.ProxyConfig{
+		Skipper:  proxySkipper,
+		Balancer: balancer,
+	}
+
+	// Protect this routes with JWT even if the API is not protected
+	jwtAuthRoutes := []string{
+		"/api/v1/peers",
+		"/api/plugins",
+	}
+
+	jwtAuthSkipper := func(context echo.Context) bool {
+		path := context.Request().URL.EscapedPath()
+		for _, prefix := range jwtAuthRoutes {
+			if strings.HasPrefix(path, prefix) {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Only allow JWT created for the dashboard
+	jwtAuthAllow := func(c echo.Context, subject string, claims *jwt.AuthClaims) bool {
+		if claims.Dashboard {
+			return claims.VerifySubject(subject)
+		}
+		return false
+	}
+
+	return []echo.MiddlewareFunc{
+		jwtAuth.Middleware(jwtAuthSkipper, jwtAuthAllow),
+		middleware.ProxyWithConfig(config),
+	}
+}
+
+func calculateMimeType(e echo.Context) string {
+	url := e.Request().URL.String()
+
+	switch {
+	case strings.HasSuffix(url, ".html"):
+		return echo.MIMETextHTMLCharsetUTF8
+	case strings.HasSuffix(url, ".css"):
+		return "text/css"
+	case strings.HasSuffix(url, ".js"):
+		return echo.MIMEApplicationJavaScript
+	case strings.HasSuffix(url, ".json"):
+		return echo.MIMEApplicationJSONCharsetUTF8
+	case strings.HasSuffix(url, ".png"):
+		return "image/png"
+	case strings.HasSuffix(url, ".svg"):
+		return "image/svg+xml"
+	default:
+		return echo.MIMETextHTMLCharsetUTF8
+	}
 }
 
 func enforceMaxOneDotPerURL(next echo.HandlerFunc) echo.HandlerFunc {
@@ -63,93 +168,67 @@ func enforceMaxOneDotPerURL(next echo.HandlerFunc) echo.HandlerFunc {
 	}
 }
 
+func authRoute(c echo.Context) error {
+
+	type loginRequest struct {
+		JWT      string `json:"jwt"`
+		User     string `json:"user"`
+		Password string `json:"password"`
+	}
+
+	request := &loginRequest{}
+
+	if err := c.Bind(request); err != nil {
+		return errors.WithMessagef(ErrInvalidParameter, "invalid request, error: %s", err)
+	}
+
+	if len(request.JWT) > 0 {
+		// Verify JWT is still valid
+		if !jwtAuth.VerifyJWT(request.JWT, func(claims *jwt.AuthClaims) bool {
+			return claims.Dashboard
+		}) {
+			return echo.ErrUnauthorized
+		}
+	} else if !basicAuth.VerifyUsernameAndPassword(request.User, request.Password) {
+		return echo.ErrUnauthorized
+	}
+
+	t, err := jwtAuth.IssueJWT(false, true)
+	if err != nil {
+		return err
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{
+		"jwt": t,
+	})
+}
+
 func setupRoutes(e *echo.Echo) {
 
 	e.Pre(enforceMaxOneDotPerURL)
+	e.Use(middleware.CSRF())
 
-	if config.NodeConfig.GetBool(config.CfgDashboardDevMode) {
-		e.Static("/assets", "./plugins/dashboard/frontend/src/assets")
-	} else {
-		// load assets from packr: either from within the binary or actual disk
-		e.GET("/app/*", echo.WrapHandler(http.StripPrefix("/app", http.FileServer(appBox))))
-		e.GET("/assets/*", echo.WrapHandler(http.StripPrefix("/assets", http.FileServer(assetsBox))))
+	mw := appBoxMiddleware()
+	if deps.NodeConfig.Bool(CfgDashboardDevMode) {
+		mw = devModeReverseProxyMiddleware()
 	}
+	e.Group("/*").Use(mw)
+
+	// Pass all the explorer request through to the local rest API
+	e.Group("/api", apiMiddlewares()...)
 
 	e.GET("/ws", websocketRoute)
-	e.GET("/", indexRoute)
 
-	// used to route into the dashboard index
-	e.GET("*", indexRoute)
-
-	apiRoutes := e.Group("/api")
-
-	setupExplorerRoutes(apiRoutes)
-
-	e.HTTPErrorHandler = func(err error, c echo.Context) {
-		c.Logger().Error(err)
-
-		var statusCode int
-		var message string
-
-		switch errors.Cause(err) {
-
-		case echo.ErrNotFound:
-			c.Redirect(http.StatusSeeOther, "/")
-			return
-
-		case echo.ErrUnauthorized:
-			statusCode = http.StatusUnauthorized
-			message = "unauthorized"
-
-		case ErrForbidden:
-			statusCode = http.StatusForbidden
-			message = "access forbidden"
-
-		case ErrInternalError:
-			statusCode = http.StatusInternalServerError
-			message = "internal server error"
-
-		case ErrNotFound:
-			statusCode = http.StatusNotFound
-			message = "not found"
-
-		case ErrInvalidParameter:
-			statusCode = http.StatusBadRequest
-			message = "bad request"
-
-		default:
-			statusCode = http.StatusInternalServerError
-			message = "internal server error"
-		}
-
-		message = fmt.Sprintf("%s, error: %+v", message, err)
-		c.String(statusCode, message)
+	// Rate-limit the auth endpoint
+	rateLimiterConfig := middleware.RateLimiterConfig{
+		Store: middleware.NewRateLimiterMemoryStoreWithConfig(
+			middleware.RateLimiterMemoryStoreConfig{
+				Rate:      rate.Limit(1 / 300.0), // 1 request every 5 minutes
+				Burst:     10,                    // additional burst of 10 requests
+				ExpiresIn: 5 * time.Minute,
+			},
+		),
 	}
-}
 
-func websocketRoute(c echo.Context) error {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Errorf("recovered from panic within WS handle func: %s", r)
-		}
-	}()
-	hub.ServeWebsocket(c.Response(), c.Request(), func(client *websockethub.Client) {
-		log.Info("WebSocket client connection established")
-
-		client.Send(&msg{MsgTypeNodeStatus, currentNodeStatus()})
-		client.Send(&msg{MsgTypeConfirmedMsMetrics, cachedMilestoneMetrics})
-		client.Send(&msg{MsgTypeDatabaseSizeMetric, cachedDbSizeMetrics})
-		client.Send(&msg{MsgTypeDatabaseCleanupEvent, lastDbCleanup})
-		start := tangle.GetLatestMilestoneIndex()
-		for i := start - 10; i <= start; i++ {
-			if cachedMsTailTx := getMilestoneTail(i); cachedMsTailTx != nil { // tx +1
-				client.Send(&msg{MsgTypeMs, &ms{cachedMsTailTx.GetTransaction().GetHash(), i}})
-				cachedMsTailTx.Release(true) // tx -1
-			} else {
-				break
-			}
-		}
-	})
-
-	return nil
+	e.POST("/auth", authRoute, middleware.RateLimiterWithConfig(rateLimiterConfig))
 }
